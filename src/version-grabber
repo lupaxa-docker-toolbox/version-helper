@@ -74,6 +74,13 @@
 #   apk, apt, pacman              name=version
 #   dnf, microdnf, yum, tdnf      name-version-release
 #
+# tdnf info lists every build, newest first. The pin is the highest
+# version-release, which is the package tdnf install selects.
+#
+# An RPM image that already has curl-minimal, and not curl, is pinned
+# to curl-minimal. Installing the curl package removes curl-minimal
+# and the transaction fails.
+#
 # A non-zero RPM epoch stays in the pin (openssl-devel-1:3.5.8-2.el9).
 # Epoch 0 is omitted. The architecture suffix is omitted (.x86_64,
 # .aarch64, .noarch, and the other names strip_nevra knows). A name
@@ -219,17 +226,37 @@ info_evr() {
 # "name-version-release".
 strip_nevra() {
     printf '%s\n' "$1" \
-        | sed -E 's/\.(noarch|x86_64|aarch64|arm64|i686|i386|s390x|ppc64le|ppc64)$//' \
+        | sed -E 's/\.(noarch|x86_64|aarch64|arm64|i686|i386|s390x|ppc64le|ppc64|src)$//' \
         | sed -E 's/-0:/-/'
+}
+
+# curl-minimal already provides the curl command. Asking for curl
+# makes dnf try to replace it and the install fails.
+rpm_install_name() {
+    case "$1" in
+        curl)
+            if have rpm \
+                && rpm -q curl-minimal >/dev/null 2>&1 \
+                && ! rpm -q curl >/dev/null 2>&1; then
+                printf '%s\n' curl-minimal
+                return
+            fi
+            ;;
+    esac
+    printf '%s\n' "$1"
 }
 
 # --qf is dnf 4. --queryformat is the older spelling. Try both, and
 # keep the first non-empty line. strip_nevra then drops the arch and
 # an epoch of 0.
 dnf_pin() {
-    nevra=$(dnf -q repoquery --latest-limit 1 --qf '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF { print; exit }')
+    arch=$(rpm --eval '%{_arch}' 2>/dev/null || true)
+    nevra=$(dnf -q repoquery --latest-limit 1 --arch "$arch" --arch noarch --qf '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF && $0 !~ /\.src$/ { print; exit }')
     if [ -z "$nevra" ]; then
-        nevra=$(dnf -q repoquery --latest-limit 1 --queryformat '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF { print; exit }')
+        nevra=$(dnf -q repoquery --latest-limit 1 --arch "$arch" --arch noarch --queryformat '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF && $0 !~ /\.src$/ { print; exit }')
+    fi
+    if [ -z "$nevra" ]; then
+        nevra=$(dnf -q repoquery --latest-limit 1 --qf '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF && $0 !~ /\.src$/ { print; exit }')
     fi
     if [ -n "$nevra" ]; then
         strip_nevra "$nevra"
@@ -243,7 +270,7 @@ microdnf_pin() {
     nevra=$(microdnf repoquery "$1" 2>/dev/null | awk -v pkg="$1" '
         index($0, pkg "-") == 1 {
             rest = substr($0, length(pkg) + 2)
-            if (rest ~ /^[0-9]/ && $0 !~ /\.src$/) {
+            if (rest ~ /^[0-9]/ && $0 !~ /\.src[[:space:]]*$/) {
                 last = $0
             }
         }
@@ -266,7 +293,14 @@ yum_pin() {
 }
 
 tdnf_pin() {
-    evr=$(tdnf info "$1" 2>/dev/null | info_evr)
+    evr=$(tdnf info "$1" 2>/dev/null | awk '
+        /^Version/ { version = $NF }
+        /^Release/ {
+            if (version != "") {
+                printf "%s-%s\n", version, $NF
+            }
+        }
+    ' | sort -V | tail -n 1)
     if [ -n "$evr" ]; then
         printf '%s-%s\n' "$1" "$evr"
     fi
@@ -294,6 +328,11 @@ emit_install() {
         printf '%s\n' "$packages" | awk '{ for (i = 1; i <= NF; i++) print $i }' > "$names"
         while IFS= read -r package; do
             [ -n "$package" ] || continue
+            case "$style" in
+                rpm-*)
+                    package=$(rpm_install_name "$package")
+                    ;;
+            esac
             pin=''
             case "$style" in
                 equals-apk)

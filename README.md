@@ -107,7 +107,9 @@ Pull the tag when you want pins from the registry rather than a local image. `do
 
 Package names are a space-separated list with no quotes. `DNF_PACKAGES` falls back to `YUM_PACKAGES` when it is unset, so an older config keeps working.
 
-RPM pins include the release. A non-zero epoch stays in the pin (`openssl-devel-1:3.5.8-2.0.1.el9_8`). An epoch of 0 is omitted.
+RPM pins include the release. A non-zero epoch stays in the pin (`openssl-devel-1:3.5.8-2.0.1.el9_8`). An epoch of 0 is omitted. Photon pins the newest build.
+
+An image that already has `curl-minimal` is pinned to that package instead of `curl`.
 
 ### Package Manager Lists
 
@@ -223,7 +225,7 @@ The same [config/config.example](config/config.example) file produced these frag
   dnf makecache && \
   dnf install -y \
     bash-5.2.15-1.amzn2023.0.2 \
-    curl-8.21.0-5.amzn2023.0.5 \
+    curl-minimal-8.21.0-5.amzn2023.0.5 \
     git-2.50.1-1.amzn2023.0.2 \
     openssl-devel-1:3.5.8-1.amzn2023.0.4 \
     wget-1.21.3-1.amzn2023.0.5 \
