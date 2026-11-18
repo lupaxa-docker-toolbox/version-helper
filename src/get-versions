@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+#
+# get-versions — print a pinned Dockerfile install fragment for one image.
+#
+# This script runs on the host. It does not query packages itself. It starts
+# the image you name, mounts version-grabber read-only at /version-grabber,
+# and passes the config file through with docker --env-file. The shell you
+# name then runs the grabber inside that image. Docker must be on PATH and
+# able to run the image. The grabber is POSIX sh; see its header for the
+# environment variables, pin formats, and package-manager order.
+#
+# stdout is only the fragment. A short header (image, tag, shell, config,
+# grabber) goes to stderr unless -p is set. Errors go to stderr. The exit
+# status is whatever docker returns, which is the grabber's status when the
+# container starts: 0 when at least one package resolved, 1 when none did.
+# A bad flag, a missing -c or -o, or a missing docker binary exits 1 before
+# the container starts. -h exits 0.
+#
+# The fragment is tab-indented. Each line ends with "&& \" so it can sit
+# under a RUN instruction and more commands can follow. Cache cleanup is
+# left to the caller. The pins cover the hadolint version rules only.
+#
+# The grabber path defaults to version-grabber beside this script, then
+# ~/bin/version-grabber. -c and -g are resolved with realpath, grealpath,
+# or python3, in that order. One of those has to be on PATH.
+#
+# Combined short flags such as -hp are not accepted. Each flag is its own
+# argument. A value must not start with "-".
+#
+#   -h, --help       Show the help, then exit 0
+#   -d, --debug      set -x for this script, including the docker command
+#   -p, --package    Omit the stderr header
+#   -c, --config     Required. Package list (docker env-file syntax)
+#   -g, --grabber    Path to version-grabber
+#   -o, --os         Required. Image name, including a registry prefix
+#                    (alpine, ubuntu, quay.io/centos/centos)
+#   -s, --shell      Shell inside the image. Default bash.
+#                    Alpine has no bash: pass ash. Many slim images need sh.
+#   -t, --tag        Image tag. Default latest. An image already present
+#                    locally is reused; otherwise docker pulls it.
+#   -P, --platform   docker --platform, for example linux/amd64.
+#                    Arch Linux publishes amd64 only. On Apple Silicon pass
+#                    -P linux/amd64. Omit the flag to use the daemon default.
+#
+# Examples:
+#   get-versions -c config/config.example -o alpine -t 3.24 -s ash
+#   get-versions -p -c config/config.example -o debian -t 13
+#   get-versions -c config/config.example -o archlinux -P linux/amd64
+#   get-versions -c config/config.example -o quay.io/centos/centos -t stream10
+#
+
+set -euo pipefail
+
+NO_HEADERS=false
+CONFIG_FILE=''
+GRABBER_SCRIPT=''
+OSNAME=''
+SHELLNAME=''
+PLATFORM=''
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    local status=${1:-0}
+    cat <<EOF
+Usage: $0 [-h] [-d] [-p] -c config -o image [-g grabber] [-s shell] [-t tag] [-P platform]
+
+Run version-grabber inside a distro image and print a pinned install
+fragment. stdout is only that fragment. A short header goes to stderr
+unless -p is set. Errors go to stderr. Exit 0 when at least one package
+resolved. Exit 1 when none did, or when the arguments are incomplete.
+-h exits 0.
+
+The fragment is tab-indented and each line ends with '&& \\' so it can
+follow a RUN instruction. Cache cleanup is left to the caller.
+
+  -h, --help       Show this help
+  -d, --debug      Trace this script (set -x), including the docker command
+  -p, --package    Omit the stderr header
+  -c, --config     Package config file (docker env-file syntax). Required
+  -g, --grabber    version-grabber path
+                   (default: beside this script, else ~/bin/version-grabber)
+  -o, --os         Image name, for example alpine, ubuntu, or
+                   quay.io/centos/centos. Required
+  -s, --shell      Shell inside the image (default: bash; ash on Alpine,
+                   sh on images that have no bash)
+  -t, --tag        Image tag (default: latest). A local image is reused
+  -P, --platform   Docker platform, for example linux/amd64
+
+Each flag is a separate argument. Combined short flags such as -hp are
+rejected, and a value must not start with "-".
+
+Examples:
+  $0 -c config/config.example -o alpine -t 3.24 -s ash
+  $0 -p -c config/config.example -o debian -t 13
+  $0 -c config/config.example -o archlinux -P linux/amd64
+EOF
+    exit "$status"
+}
+
+# Absolute path. realpath, then grealpath, then python3.
+abs_path() {
+    local path=$1
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path"
+    elif command -v grealpath >/dev/null 2>&1; then
+        grealpath "$path"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$path"
+    else
+        die "realpath is not available"
+    fi
+}
+
+# Prefer the sibling script so a repo checkout works without installing.
+# Fall back to ~/bin for a copied pair.
+default_grabber() {
+    local script_dir sibling
+    script_dir=$(unset CDPATH; cd -- "$(dirname "$0")" && pwd)
+    sibling="${script_dir}/version-grabber"
+    if [[ -r "$sibling" ]]; then
+        printf '%s\n' "$sibling"
+        return 0
+    fi
+    if [[ -r "${HOME}/bin/version-grabber" ]]; then
+        abs_path "${HOME}/bin/version-grabber"
+        return 0
+    fi
+    die "version-grabber was not found beside this script or in ~/bin"
+}
+
+# $1 is the flag name. $2 is the candidate value. Reject a missing value
+# and a value that looks like another flag.
+require_value() {
+    [[ $# -ge 2 && -n "${2:-}" && "${2:0:1}" != "-" ]] || die "$1 needs a value"
+}
+
+process_arguments() {
+    if [[ $# -eq 0 ]]; then
+        usage 1
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                usage 0
+                ;;
+            -d|--debug)
+                set -x
+                shift
+                ;;
+            -p|--package)
+                NO_HEADERS=true
+                shift
+                ;;
+            -c|--config)
+                require_value "$@"
+                CONFIG_FILE=$(abs_path "$2")
+                [[ -r "$CONFIG_FILE" ]] || die "cannot read config file: ${CONFIG_FILE}"
+                shift 2
+                ;;
+            -g|--grabber)
+                require_value "$@"
+                GRABBER_SCRIPT=$(abs_path "$2")
+                [[ -r "$GRABBER_SCRIPT" ]] || die "cannot read grabber: ${GRABBER_SCRIPT}"
+                shift 2
+                ;;
+            -o|--os)
+                require_value "$@"
+                OSNAME=$2
+                shift 2
+                ;;
+            -s|--shell)
+                require_value "$@"
+                SHELLNAME=$2
+                shift 2
+                ;;
+            -t|--tag)
+                require_value "$@"
+                TAGNAME=$2
+                shift 2
+                ;;
+            -P|--platform)
+                require_value "$@"
+                PLATFORM=$2
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                die "unexpected argument: $1"
+                ;;
+        esac
+    done
+
+    [[ -n "$CONFIG_FILE" ]] || usage 1
+    [[ -n "$OSNAME" ]] || usage 1
+    if [[ -z "$GRABBER_SCRIPT" ]]; then
+        GRABBER_SCRIPT=$(default_grabber)
+        GRABBER_SCRIPT=$(abs_path "$GRABBER_SCRIPT")
+    fi
+    SHELLNAME=${SHELLNAME:-bash}
+    TAGNAME=${TAGNAME:-latest}
+}
+
+main() {
+    process_arguments "$@"
+    command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
+
+    if [[ "$NO_HEADERS" == false ]]; then
+        printf 'Package versions for %s:%s (%s)\n' "$OSNAME" "$TAGNAME" "$SHELLNAME" >&2
+        printf 'Config: %s\n' "$(basename "$CONFIG_FILE")" >&2
+        printf 'Grabber: %s\n' "$(basename "$GRABBER_SCRIPT")" >&2
+    fi
+
+    export DOCKER_CLI_HINTS=false
+    # Build the argument list in an array so an empty --platform is omitted.
+    # Bash 3.2 (macOS) accepts this form. The grabber mount is read-only.
+    docker_args=(run --rm)
+    if [[ -n "$PLATFORM" ]]; then
+        docker_args+=(--platform "$PLATFORM")
+    fi
+    docker_args+=(
+        -v "${GRABBER_SCRIPT}:/version-grabber:ro"
+        --env-file="$CONFIG_FILE"
+        "${OSNAME}:${TAGNAME}"
+        "$SHELLNAME"
+        /version-grabber
+    )
+    docker "${docker_args[@]}"
+}
+
+main "$@"

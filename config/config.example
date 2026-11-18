@@ -1,0 +1,13 @@
+# Space-separated package names. No quotes.
+# DNF_PACKAGES falls back to YUM_PACKAGES when it is unset.
+# Groups are a space-separated list of quoted strings, for example:
+# YUM_GROUPS="Development Tools"
+
+APK_PACKAGES=bash curl git openssl-dev wget
+APK_VIRTUAL_PACKAGES=
+APT_PACKAGES=bash curl git libssl-dev wget
+PACMAN_PACKAGES=bash curl git openssl wget
+TDNF_PACKAGES=bash curl git openssl-devel wget
+DNF_PACKAGES=bash curl git openssl-devel wget
+YUM_PACKAGES=bash curl git openssl-devel wget
+YUM_GROUPS=

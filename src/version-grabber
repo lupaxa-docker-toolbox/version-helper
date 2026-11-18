@@ -1,0 +1,580 @@
+#!/bin/sh
+#
+# version-grabber — query this image's package manager and print a pinned
+# install fragment.
+#
+# POSIX sh, on purpose. Alpine ash has to be able to run it. Do not add
+# bash features (pipefail, arrays, [[ ]], local, function keyword).
+# get-versions is the usual way to start this script. It mounts this file
+# read-only at /version-grabber and passes the config with --env-file.
+# You can also run it yourself:
+#
+#   docker run --rm \
+#     -v "$PWD/src/version-grabber:/version-grabber:ro" \
+#     --env-file=config/config.example \
+#     alpine:3.24 ash /version-grabber
+#
+# There are no arguments. Package names come from the environment. stdout
+# is only the fragment. A name with no candidate, and every error, goes to
+# stderr. Exit 0 when at least one install line or group was emitted.
+# Exit 1 when nothing resolved, DISCOVER_BY=OS names an unknown ID, awk
+# cannot be installed, or the package manager command fails.
+#
+# Discovery
+#
+# DISCOVER_BY unset, or set to anything other than "os" (any case):
+# use the first package manager that is on PATH, in this order:
+#
+#   apk, apt-get, pacman, tdnf, dnf, microdnf, yum
+#
+# DISCOVER_BY=OS reads ID from /etc/os-release and uses that family's
+# variables. There is no fallback to the manager lists. An unknown ID
+# is an error.
+#
+#   almalinux   ALMA_PACKAGES, ALMA_GROUPS          (dnf, microdnf, or yum)
+#   alpine      ALPINE_PACKAGES, ALPINE_VIRTUAL_PACKAGES
+#   amzn        AMAZON_PACKAGES, AMAZON_GROUPS      (Amazon Linux)
+#   arch        ARCH_PACKAGES
+#   centos      CENTOS_PACKAGES, CENTOS_GROUPS
+#   debian      DEBIAN_PACKAGES
+#   ol          ORACLE_PACKAGES, ORACLE_GROUPS      (Oracle Linux)
+#   photon      PHOTON_PACKAGES                     (tdnf)
+#   rocky       ROCKY_PACKAGES, ROCKY_GROUPS
+#   ubuntu      UBUNTU_PACKAGES
+#
+# Manager lists, used when discovery is not by OS:
+#
+#   APK_PACKAGES              space-separated names
+#   APK_VIRTUAL_PACKAGES      apk add with no version (meta packages)
+#   APT_PACKAGES
+#   PACMAN_PACKAGES
+#   TDNF_PACKAGES
+#   DNF_PACKAGES              falls back to YUM_PACKAGES when unset
+#   DNF_GROUPS                falls back to YUM_GROUPS when unset
+#   YUM_PACKAGES
+#   YUM_GROUPS
+#
+# ALPINE_VIRTUAL_PACKAGE is the old name for ALPINE_VIRTUAL_PACKAGES.
+# The same alias is accepted for APK_VIRTUAL_PACKAGES.
+#
+# Package names are split on whitespace. Do not quote them. Group names
+# are a space-separated list of double-quoted strings, because a group
+# can contain spaces:
+#
+#   YUM_GROUPS="Development Tools" "Security Tools"
+#
+# Groups are not versioned. dnf and yum emit groupinstall. microdnf has
+# no group install, so a microdnf image installs dnf first when a group
+# list is set, then emits dnf groupinstall.
+#
+# Pins
+#
+# Only the fields hadolint's version rules require are included.
+#
+#   apk, apt, pacman              name=version
+#   dnf, microdnf, yum, tdnf      name-version-release
+#
+# A non-zero RPM epoch stays in the pin (openssl-devel-1:3.5.8-2.el9).
+# Epoch 0 is omitted. The architecture suffix is omitted (.x86_64,
+# .aarch64, .noarch, and the other names strip_nevra knows). A name
+# with no candidate is left out and reported on stderr. If every name
+# is left out and there is no group list, stdout is empty and the
+# script exits 1.
+#
+# Fragment
+#
+# Lines are indented with tabs. A section's refresh command is printed
+# only when that section produced install lines:
+#
+#   apk update &&
+#   apt-get update &&
+#   pacman -Syu --noconfirm &&
+#   tdnf makecache &&
+#   dnf makecache &&
+#   yum makecache &&
+#   microdnf makecache &&     or  microdnf update -y &&
+#
+# Each install command ends with "&& \" so later commands can continue
+# the same RUN instruction. Removing the package lists to satisfy a
+# hadolint cache-cleanup rule is left to the caller.
+#
+# What the query changes inside the container
+#
+# awk or gawk is installed when awk is missing. It is used to split
+# names and to parse query output. The container is disposable.
+#
+# Pacman 7 refuses to sync when its seccomp sandbox cannot run, which
+# happens under QEMU on Apple Silicon. On that error, DisableSandbox is
+# appended to /etc/pacman.conf and the sync is retried. The printed
+# fragment still uses a normal pacman command.
+#
+# Repo metadata downloaded for the query is discarded with the container.
+# The read-only mount means this script is not modified.
+#
+
+set -eu
+
+WORK=''
+
+die() {
+    printf 'error: %s\n' "$1" >&2
+    exit 1
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Pacman 7 refuses to sync databases when its seccomp sandbox cannot run
+# (common under QEMU on Apple Silicon). The container is disposable.
+pacman_sync() {
+    err=$(mktemp)
+    if pacman -Sy --noconfirm >/dev/null 2>"$err"; then
+        rm -f "$err"
+        return 0
+    fi
+    if grep -q -e seccomp -e sandbox "$err"; then
+        printf '\nDisableSandbox\n' >> /etc/pacman.conf
+        rm -f "$err"
+        pacman -Sy --noconfirm >/dev/null
+        return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+}
+
+ensure_awk() {
+    if have awk; then
+        return 0
+    fi
+
+    if have apk; then
+        apk add --no-cache gawk >/dev/null 2>&1 || true
+    elif have apt-get; then
+        apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gawk >/dev/null 2>&1 || true
+    elif have pacman; then
+        pacman_sync >/dev/null 2>&1 || true
+        pacman -S --noconfirm --needed awk >/dev/null 2>&1 || true
+    elif have tdnf; then
+        tdnf makecache >/dev/null 2>&1 || true
+        tdnf install -y gawk >/dev/null 2>&1 || true
+    elif have microdnf; then
+        microdnf install -y gawk >/dev/null 2>&1 || true
+    elif have dnf; then
+        dnf install -y -q gawk >/dev/null 2>&1 || true
+    elif have yum; then
+        yum install -y -q gawk >/dev/null 2>&1 || true
+    fi
+
+    if ! have awk; then
+        die "awk is not installed and could not be added"
+    fi
+}
+
+# Exact-name search. The first non-empty line is "name-version"; the
+# version is everything after the first "name-" prefix.
+apk_version() {
+    line=$(apk search -e "$1" 2>/dev/null | awk 'NF { print; exit }')
+    prefix="${1}-"
+    case "$line" in
+        "$prefix"*)
+            printf '%s\n' "${line#"$prefix"}"
+            ;;
+    esac
+}
+
+# apt-cache policy "Candidate:" field. "(none)" means the name is not
+# in the enabled repositories.
+apt_version() {
+    version=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ { print $2; exit }')
+    if [ -n "$version" ] && [ "$version" != "(none)" ]; then
+        printf '%s\n' "$version"
+    fi
+}
+
+# pacman -Si "Version" field. The third field is the version.
+pacman_version() {
+    pacman -Si "$1" 2>/dev/null | awk '/^Version/ { print $3; exit }'
+}
+
+# Last Version/Release pair in info output. Installed packages list the
+# available package after the installed one.
+info_evr() {
+    awk '
+        /^Version/ { version = $NF }
+        /^Release/ { release = $NF }
+        END {
+            if (version != "" && release != "") {
+                printf "%s-%s\n", version, release
+            }
+        }
+    '
+}
+
+# Drop the architecture and an epoch of 0 from an NEVRA string.
+# A non-zero epoch (the "1:" in "name-1:version-release") is kept.
+# Epoch 0 is written "name-0:version-release"; removing "-0:" leaves
+# "name-version-release".
+strip_nevra() {
+    printf '%s\n' "$1" \
+        | sed -E 's/\.(noarch|x86_64|aarch64|arm64|i686|i386|s390x|ppc64le|ppc64)$//' \
+        | sed -E 's/-0:/-/'
+}
+
+# --qf is dnf 4. --queryformat is the older spelling. Try both, and
+# keep the first non-empty line. strip_nevra then drops the arch and
+# an epoch of 0.
+dnf_pin() {
+    nevra=$(dnf -q repoquery --latest-limit 1 --qf '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF { print; exit }')
+    if [ -z "$nevra" ]; then
+        nevra=$(dnf -q repoquery --latest-limit 1 --queryformat '%{name}-%{epoch}:%{version}-%{release}.%{arch}' "$1" 2>/dev/null | awk 'NF { print; exit }')
+    fi
+    if [ -n "$nevra" ]; then
+        strip_nevra "$nevra"
+    fi
+}
+
+# microdnf repoquery prints a metadata line, then every historical
+# NEVRA, then often a .src line. Keep the last binary line whose
+# text after "name-" starts with a digit, which is the newest build.
+microdnf_pin() {
+    nevra=$(microdnf repoquery "$1" 2>/dev/null | awk -v pkg="$1" '
+        index($0, pkg "-") == 1 {
+            rest = substr($0, length(pkg) + 2)
+            if (rest ~ /^[0-9]/ && $0 !~ /\.src$/) {
+                last = $0
+            }
+        }
+        END {
+            if (last != "") {
+                print last
+            }
+        }
+    ')
+    if [ -n "$nevra" ]; then
+        strip_nevra "$nevra"
+    fi
+}
+
+yum_pin() {
+    evr=$(yum -q info "$1" 2>/dev/null | info_evr)
+    if [ -n "$evr" ]; then
+        printf '%s-%s\n' "$1" "$evr"
+    fi
+}
+
+tdnf_pin() {
+    evr=$(tdnf info "$1" 2>/dev/null | info_evr)
+    if [ -n "$evr" ]; then
+        printf '%s-%s\n' "$1" "$evr"
+    fi
+}
+
+# Append one install command for the names that resolved.
+# $1 is the install command, without a leading tab or trailing continuation.
+# $2 is a space-separated package list. Empty means emit nothing.
+# $3 is the pin style: equals-apk, equals-apt, equals-pacman,
+# rpm-dnf, rpm-microdnf, rpm-yum, rpm-tdnf, or plain (no version).
+# Names are split with awk into a file and read back, not via "set --",
+# so the function arguments stay intact. The read is a redirect, not a
+# pipe, so the resolved count is not lost in a subshell.
+# A name that does not resolve is reported on stderr and omitted.
+# Nothing is written when every name is omitted.
+emit_install() {
+    install_line=$1
+    packages=$2
+    style=$3
+    lines=$(mktemp)
+    count=0
+
+    names=$(mktemp)
+    if [ -n "$packages" ]; then
+        printf '%s\n' "$packages" | awk '{ for (i = 1; i <= NF; i++) print $i }' > "$names"
+        while IFS= read -r package; do
+            [ -n "$package" ] || continue
+            pin=''
+            case "$style" in
+                equals-apk)
+                    version=$(apk_version "$package" || true)
+                    [ -n "$version" ] && pin="${package}=${version}"
+                    ;;
+                equals-apt)
+                    version=$(apt_version "$package" || true)
+                    [ -n "$version" ] && pin="${package}=${version}"
+                    ;;
+                equals-pacman)
+                    version=$(pacman_version "$package" || true)
+                    [ -n "$version" ] && pin="${package}=${version}"
+                    ;;
+                rpm-dnf)
+                    pin=$(dnf_pin "$package" || true)
+                    ;;
+                rpm-microdnf)
+                    pin=$(microdnf_pin "$package" || true)
+                    ;;
+                rpm-yum)
+                    pin=$(yum_pin "$package" || true)
+                    ;;
+                rpm-tdnf)
+                    pin=$(tdnf_pin "$package" || true)
+                    ;;
+                plain)
+                    pin=$package
+                    ;;
+                *)
+                    die "unknown pin style: ${style}"
+                    ;;
+            esac
+            if [ -n "$pin" ]; then
+                printf '\t\t%s \\\n' "$pin" >> "$lines"
+                count=$((count + 1))
+            else
+                printf 'no version for %s\n' "$package" >&2
+            fi
+        done < "$names"
+    fi
+    rm -f "$names"
+
+    if [ "$count" -gt 0 ]; then
+        {
+            printf '\t%s \\\n' "$install_line"
+            cat "$lines"
+            printf '\t\t%s \\\n' "&&"
+        } >> "$WORK"
+    fi
+    rm -f "$lines"
+}
+
+# $1 is the groupinstall command. $2 is a space-separated list of
+# double-quoted group names. Unquoted text is ignored. An empty list
+# returns without writing. A non-empty list with no quotes is an error,
+# so a forgotten quote is not silently dropped.
+emit_groups() {
+    group_list=$2
+    [ -n "$group_list" ] || return 0
+
+    names=$(printf '%s\n' "$group_list" | awk '
+        {
+            rest = $0
+            while (match(rest, /"[^"]+"/)) {
+                print substr(rest, RSTART + 1, RLENGTH - 2)
+                rest = substr(rest, RSTART + RLENGTH)
+            }
+        }
+    ')
+    if [ -z "$names" ]; then
+        die "group list has no quoted names: ${group_list}"
+    fi
+
+    printf '\t%s \\\n' "$1" >> "$WORK"
+    printf '%s\n' "$names" | while IFS= read -r group; do
+        [ -n "$group" ] || continue
+        printf '\t\t"%s" \\\n' "$group" >> "$WORK"
+    done
+    printf '\t\t%s \\\n' "&&" >> "$WORK"
+}
+
+# Divert later writes into a temp file. commit_section prepends the
+# refresh command and keeps the section only when it is non-empty, so a
+# manager with no resolved packages does not emit a bare "makecache".
+begin_section() {
+    SECTION=$(mktemp)
+    SAVED_WORK=$WORK
+    WORK=$SECTION
+}
+
+commit_section() {
+    prelude=$1
+    if [ -s "$SECTION" ]; then
+        printf '\t%s \\\n' "$prelude" >> "$SAVED_WORK"
+        cat "$SECTION" >> "$SAVED_WORK"
+    fi
+    rm -f "$SECTION"
+    WORK=$SAVED_WORK
+}
+
+emit_apk() {
+    packages=$1
+    virtual=$2
+    apk update >/dev/null
+    begin_section
+    emit_install "apk add --no-cache" "$packages" equals-apk
+    emit_install "apk add --no-cache" "$virtual" plain
+    commit_section "apk update &&"
+}
+
+emit_apt() {
+    apt-get update -qq >/dev/null
+    begin_section
+    emit_install "apt-get -y --no-install-recommends install" "$1" equals-apt
+    commit_section "apt-get update &&"
+}
+
+emit_pacman() {
+    pacman_sync
+    begin_section
+    emit_install "pacman -S --noconfirm" "$1" equals-pacman
+    commit_section "pacman -Syu --noconfirm &&"
+}
+
+emit_tdnf() {
+    tdnf makecache >/dev/null
+    begin_section
+    emit_install "tdnf install -y" "$1" rpm-tdnf
+    commit_section "tdnf makecache &&"
+}
+
+emit_dnf() {
+    packages=$1
+    groups=$2
+    dnf -q makecache >/dev/null
+    begin_section
+    emit_install "dnf install -y" "$packages" rpm-dnf
+    emit_groups "dnf groupinstall -y" "$groups"
+    commit_section "dnf makecache &&"
+}
+
+emit_yum() {
+    packages=$1
+    groups=$2
+    yum -q makecache >/dev/null
+    begin_section
+    emit_install "yum install -y" "$packages" rpm-yum
+    emit_groups "yum groupinstall -y" "$groups"
+    commit_section "yum makecache &&"
+}
+
+emit_microdnf() {
+    packages=$1
+    groups=$2
+    if ! microdnf makecache >/dev/null 2>&1; then
+        microdnf update -y >/dev/null 2>&1 || true
+    fi
+    begin_section
+    emit_install "microdnf install -y" "$packages" rpm-microdnf
+    if [ -n "$groups" ]; then
+        if ! have dnf && ! have yum; then
+            microdnf install -y dnf >/dev/null
+        fi
+        if have dnf; then
+            emit_groups "dnf groupinstall -y" "$groups"
+        elif have yum; then
+            emit_groups "yum groupinstall -y" "$groups"
+        else
+            die "group install needs dnf or yum"
+        fi
+    fi
+    if have microdnf && microdnf makecache --help >/dev/null 2>&1; then
+        commit_section "microdnf makecache &&"
+    else
+        commit_section "microdnf update -y &&"
+    fi
+}
+
+emit_rpm() {
+    packages=$1
+    groups=$2
+    if have dnf; then
+        emit_dnf "$packages" "$groups"
+    elif have microdnf; then
+        emit_microdnf "$packages" "$groups"
+    elif have yum; then
+        emit_yum "$packages" "$groups"
+    else
+        die "no rpm package manager found"
+    fi
+}
+
+os_id() {
+    if [ -f /etc/os-release ]; then
+        awk -F= '/^ID=/ { gsub(/"/, "", $2); print $2; exit }' /etc/os-release
+    else
+        printf '%s\n' unknown
+    fi
+}
+
+# ID values are the /etc/os-release tokens, not the image names.
+# Oracle Linux is "ol". Amazon Linux is "amzn".
+discover_by_os() {
+    os=$(os_id)
+    case "$os" in
+        almalinux)
+            emit_rpm "${ALMA_PACKAGES:-}" "${ALMA_GROUPS:-}"
+            ;;
+        alpine)
+            emit_apk "${ALPINE_PACKAGES:-}" "${ALPINE_VIRTUAL_PACKAGES:-${ALPINE_VIRTUAL_PACKAGE:-}}"
+            ;;
+        amzn)
+            emit_rpm "${AMAZON_PACKAGES:-}" "${AMAZON_GROUPS:-}"
+            ;;
+        arch)
+            emit_pacman "${ARCH_PACKAGES:-}"
+            ;;
+        centos)
+            emit_rpm "${CENTOS_PACKAGES:-}" "${CENTOS_GROUPS:-}"
+            ;;
+        debian)
+            emit_apt "${DEBIAN_PACKAGES:-}"
+            ;;
+        ol)
+            emit_rpm "${ORACLE_PACKAGES:-}" "${ORACLE_GROUPS:-}"
+            ;;
+        photon)
+            emit_tdnf "${PHOTON_PACKAGES:-}"
+            ;;
+        rocky)
+            emit_rpm "${ROCKY_PACKAGES:-}" "${ROCKY_GROUPS:-}"
+            ;;
+        ubuntu)
+            emit_apt "${UBUNTU_PACKAGES:-}"
+            ;;
+        *)
+            die "unknown OS (${os})"
+            ;;
+    esac
+}
+
+# First match wins: apk, apt-get, pacman, tdnf, dnf, microdnf, yum.
+# tdnf is before dnf so Photon is queried with tdnf. dnf is before
+# microdnf so a full dnf image is not queried with microdnf.
+discover_by_manager() {
+    if have apk; then
+        emit_apk "${APK_PACKAGES:-}" "${APK_VIRTUAL_PACKAGES:-${APK_VIRTUAL_PACKAGE:-}}"
+    elif have apt-get; then
+        emit_apt "${APT_PACKAGES:-}"
+    elif have pacman; then
+        emit_pacman "${PACMAN_PACKAGES:-}"
+    elif have tdnf; then
+        emit_tdnf "${TDNF_PACKAGES:-}"
+    elif have dnf; then
+        emit_dnf "${DNF_PACKAGES:-${YUM_PACKAGES:-}}" "${DNF_GROUPS:-${YUM_GROUPS:-}}"
+    elif have microdnf; then
+        emit_microdnf "${DNF_PACKAGES:-${YUM_PACKAGES:-}}" "${DNF_GROUPS:-${YUM_GROUPS:-}}"
+    elif have yum; then
+        emit_yum "${YUM_PACKAGES:-}" "${YUM_GROUPS:-}"
+    else
+        die "unsupported package manager"
+    fi
+}
+
+main() {
+    ensure_awk
+    WORK=$(mktemp)
+    trap 'rm -f "$WORK"' EXIT
+
+    discover_by=${DISCOVER_BY:-}
+    if [ -n "$discover_by" ] && printf '%s' "$discover_by" | grep -qi '^os$'; then
+        discover_by_os
+    else
+        discover_by_manager
+    fi
+
+    if [ ! -s "$WORK" ]; then
+        die "no packages resolved"
+    fi
+    cat "$WORK"
+}
+
+main
