@@ -96,7 +96,7 @@
 #   apk update &&
 #   apt-get update &&
 #   pacman -Syu --noconfirm &&
-#   tdnf makecache &&
+#   tdnf makecache --enablerepo=photon &&
 #   dnf makecache &&
 #   yum makecache &&
 #   microdnf makecache &&     or  microdnf update -y &&
@@ -109,6 +109,9 @@
 #
 # awk or gawk is installed when awk is missing. It is used to split
 # names and to parse query output. The container is disposable.
+# Photon leaves the base repo disabled. The updates repo can be skipped
+# when its metadata does not download, which hides gawk, so tdnf commands
+# also enable that base repo.
 #
 # Pacman 7 refuses to sync when its seccomp sandbox cannot run, which
 # happens under QEMU on Apple Silicon. On that error, DisableSandbox is
@@ -130,6 +133,17 @@ die() {
 
 have() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Photon ships the base repository disabled and can skip the updates
+# repository when its metadata does not download. gawk is in the base
+# repository, so tdnf has to be allowed to see it.
+tdnf_run() {
+    if [ -f /etc/yum.repos.d/photon.repo ]; then
+        tdnf "$@" --enablerepo=photon
+    else
+        tdnf "$@"
+    fi
 }
 
 # Pacman 7 refuses to sync databases when its seccomp sandbox cannot run
@@ -165,8 +179,15 @@ ensure_awk() {
         pacman_sync >/dev/null 2>&1 || true
         pacman -S --noconfirm --needed awk >/dev/null 2>&1 || true
     elif have tdnf; then
-        tdnf makecache >/dev/null 2>&1 || true
-        tdnf install -y gawk >/dev/null 2>&1 || true
+        err=$(mktemp)
+        tdnf_run makecache >"$err" 2>&1 || true
+        if ! tdnf_run install -y gawk >>"$err" 2>&1; then
+            cat "$err" >&2
+        fi
+        rm -f "$err"
+        if ! have awk && have gawk; then
+            ln -sf "$(command -v gawk)" /usr/local/bin/awk
+        fi
     elif have microdnf; then
         microdnf install -y gawk >/dev/null 2>&1 || true
     elif have dnf; then
@@ -293,7 +314,7 @@ yum_pin() {
 }
 
 tdnf_pin() {
-    evr=$(tdnf info "$1" 2>/dev/null | awk '
+    evr=$(tdnf_run info "$1" 2>/dev/null | awk '
         /^Version/ { version = $NF }
         /^Release/ {
             if (version != "") {
@@ -459,10 +480,15 @@ emit_pacman() {
 }
 
 emit_tdnf() {
-    tdnf makecache >/dev/null
+    tdnf_run makecache >/dev/null
     begin_section
-    emit_install "tdnf install -y" "$1" rpm-tdnf
-    commit_section "tdnf makecache &&"
+    if [ -f /etc/yum.repos.d/photon.repo ]; then
+        emit_install "tdnf install -y --enablerepo=photon" "$1" rpm-tdnf
+        commit_section "tdnf makecache --enablerepo=photon &&"
+    else
+        emit_install "tdnf install -y" "$1" rpm-tdnf
+        commit_section "tdnf makecache &&"
+    fi
 }
 
 emit_dnf() {

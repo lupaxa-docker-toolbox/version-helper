@@ -248,8 +248,8 @@ The same [config/config.example](config/config.example) file produced these frag
 ### Photon 5.0
 
 ```dockerfile
-  tdnf makecache && \
-  tdnf install -y \
+  tdnf makecache --enablerepo=photon && \
+  tdnf install -y --enablerepo=photon \
     bash-5.3-1.ph5 \
     curl-8.23.0-1.ph5 \
     git-2.53.0-2.ph5 \
